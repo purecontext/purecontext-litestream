@@ -17,6 +17,8 @@ export interface LitestreamOptions {
   syncInterval?: string
   snapshotInterval?: string
   retention?: string
+  l0Retention?: string
+  l0RetentionCheckInterval?: string
   envFile?: string
   logFile?: string
 }
@@ -39,7 +41,37 @@ function resolveEnv(opts: LitestreamOptions) {
   }
 }
 
+// Litestream parses config with non-strict YAML: unknown keys are silently
+// ignored. Misplacing a key yields a running daemon with defaults and no error,
+// so placement below is load-bearing and verified against the 0.5.x binary.
+//
+// Top level: l0-retention, l0-retention-check-interval, snapshot.{interval,retention}
+// Replica level: bucket, path, endpoint, region, credentials, force-path-style, sync-interval
+//
+// The L0 retention monitor issues 2 LIST calls per check per database regardless
+// of whether the database changed (upstream issue #1171). At the 15s default that
+// is ~480 requests/hour per idle database; a 24h interval reduces it to ~2/day.
+// A value of 0 disables the monitor outright but is rejected by 0.5.16 and
+// earlier, so a long interval is used instead.
+function assertPositiveDuration(value: string, key: string): void {
+  if (/^0+(s|m|h|ms|us|ns)?$/.test(value.trim())) {
+    throw new Error(
+      `[litestream] ${key} must be greater than 0 (got "${value}"). ` +
+        'Litestream refuses to start with a zero duration, which would silently disable backups.',
+    )
+  }
+}
+
 function generateConfigMulti(dbs: LitestreamOptions[]): string {
+  const first = dbs[0]
+  const l0Retention = first.l0Retention ?? '8760h'
+  const l0CheckInterval = first.l0RetentionCheckInterval ?? '24h'
+  const snapshotInterval = first.snapshotInterval ?? '24h'
+  const snapshotRetention = first.retention ?? '720h'
+
+  assertPositiveDuration(l0Retention, 'l0-retention')
+  assertPositiveDuration(l0CheckInterval, 'l0-retention-check-interval')
+
   const sections = dbs.map((opts) => {
     const env = resolveEnv(opts)
     return `  - path: ${opts.dbPath}
@@ -52,11 +84,19 @@ function generateConfigMulti(dbs: LitestreamOptions[]): string {
         access-key-id: ${env.accessKeyId}
         secret-access-key: ${env.secretAccessKey}
         force-path-style: true
-        retention: ${opts.retention ?? '720h'}
-        snapshot-interval: ${opts.snapshotInterval ?? '24h'}
         sync-interval: ${opts.syncInterval ?? '1s'}`
   })
-  return `dbs:\n${sections.join('\n')}\n`
+
+  return `l0-retention: ${l0Retention}
+l0-retention-check-interval: ${l0CheckInterval}
+
+snapshot:
+  interval: ${snapshotInterval}
+  retention: ${snapshotRetention}
+
+dbs:
+${sections.join('\n')}
+`
 }
 
 function configFileName(name: string): string {
